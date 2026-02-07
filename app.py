@@ -73,9 +73,11 @@ def cleanup_files(*files: Path):
 # ROUTES
 # ===================================
 
-@app.get("/")
+@app.get("/", methods=["GET", "HEAD"])
 async def home(request: Request):
-    """Serve main page"""
+    """Serve main page and handle UptimeRobot HEAD requests"""
+    if request.method == "HEAD":
+        return JSONResponse(content={"status": "up"})
     return templates.TemplateResponse("index.html", {"request": request})
 
 
