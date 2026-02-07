@@ -12,7 +12,7 @@ import shutil
 from pathlib import Path
 
 # PDF Processing Libraries
-from PyPDF2 import PdfReader, PdfWriter, PdfMerger
+
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter, A4, legal
 from reportlab.lib.utils import ImageReader
