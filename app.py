@@ -1,5 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.requests import Request
@@ -10,20 +10,31 @@ import os
 import io
 import shutil
 from pathlib import Path
+import re
+from collections import Counter
 
 # PDF Processing Libraries
-
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter, A4, legal
 from reportlab.lib.utils import ImageReader
+from reportlab.lib.colors import HexColor
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from PIL import Image
 import pdfplumber
-import pytesseract
 from pdf2image import convert_from_path
 import tempfile
 
+# Spell checking
+try:
+    from spellchecker import SpellChecker
+    SPELL_CHECKER_AVAILABLE = True
+except ImportError:
+    SPELL_CHECKER_AVAILABLE = False
+    SpellChecker = None
+
 # App Configuration
-app = FastAPI(title="PDF Tools Pro", version="1.0.0")
+app = FastAPI(title="PDF Tools Pro", version="2.0.0")
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -82,7 +93,7 @@ async def merge_pdfs(files: List[UploadFile] = File(...)):
     output_path = OUTPUT_DIR / f"merged_{os.urandom(8).hex()}.pdf"
     
     try:
-        merger = PdfMerger()
+        writer = PdfWriter()
         
         for file in files:
             if not file.filename.endswith('.pdf'):
@@ -92,10 +103,12 @@ async def merge_pdfs(files: List[UploadFile] = File(...)):
             save_upload_file(file, temp_path)
             temp_files.append(temp_path)
             
-            merger.append(str(temp_path))
+            reader = PdfReader(str(temp_path))
+            for page in reader.pages:
+                writer.add_page(page)
         
-        merger.write(str(output_path))
-        merger.close()
+        with open(output_path, "wb") as output_file:
+            writer.write(output_file)
         
         return FileResponse(
             output_path,
@@ -108,72 +121,6 @@ async def merge_pdfs(files: List[UploadFile] = File(...)):
     
     finally:
         cleanup_files(*temp_files)
-
-
-# ===================================
-# PDF SPLIT
-# ===================================
-
-@app.post("/api/split")
-async def split_pdf(
-    files: List[UploadFile] = File(...),
-    pages: str = Form(default="")
-):
-    """Split PDF by page numbers"""
-    if len(files) != 1:
-        raise HTTPException(status_code=400, detail="Only one file allowed")
-    
-    file = files[0]
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files allowed")
-    
-    temp_path = UPLOAD_DIR / file.filename
-    output_path = OUTPUT_DIR / f"split_{os.urandom(8).hex()}.pdf"
-    
-    try:
-        save_upload_file(file, temp_path)
-        
-        reader = PdfReader(str(temp_path))
-        writer = PdfWriter()
-        
-        # Parse page ranges (e.g., "1-3,5,7-10")
-        if pages:
-            page_numbers = parse_page_ranges(pages, len(reader.pages))
-        else:
-            page_numbers = range(len(reader.pages))
-        
-        for page_num in page_numbers:
-            if 0 <= page_num < len(reader.pages):
-                writer.add_page(reader.pages[page_num])
-        
-        with open(output_path, "wb") as output_file:
-            writer.write(output_file)
-        
-        return FileResponse(
-            output_path,
-            media_type="application/pdf",
-            filename=f"split_{os.path.basename(output_path)}"
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        cleanup_files(temp_path)
-
-
-def parse_page_ranges(ranges: str, total_pages: int) -> List[int]:
-    """Parse page ranges like '1-3,5,7-10' into list of page numbers (0-indexed)"""
-    pages = []
-    for part in ranges.split(','):
-        if '-' in part:
-            start, end = map(int, part.split('-'))
-            pages.extend(range(start - 1, min(end, total_pages)))
-        else:
-            page = int(part) - 1
-            if 0 <= page < total_pages:
-                pages.append(page)
-    return sorted(set(pages))
 
 
 # ===================================
@@ -203,17 +150,9 @@ async def compress_pdf(
         writer = PdfWriter()
         
         for page in reader.pages:
-            # Compress content streams
-            page.compress_content_streams()
             writer.add_page(page)
-        
-        # Set compression level based on quality
-        if quality == "high":
-            compression_level = 1
-        elif quality == "medium":
-            compression_level = 5
-        else:  # low
-            compression_level = 9
+            # Compress the page after adding it to the writer
+            writer.pages[-1].compress_content_streams()
         
         with open(output_path, "wb") as output_file:
             writer.write(output_file)
@@ -323,56 +262,6 @@ async def pdf_to_text(files: List[UploadFile] = File(...)):
 
 
 # ===================================
-# OCR (OPTICAL CHARACTER RECOGNITION)
-# ===================================
-
-@app.post("/api/ocr")
-async def ocr_image(
-    files: List[UploadFile] = File(...),
-    language: str = Form(default="eng")
-):
-    """Extract text from images using OCR"""
-    if len(files) != 1:
-        raise HTTPException(status_code=400, detail="Only one file allowed")
-    
-    file = files[0]
-    temp_path = UPLOAD_DIR / file.filename
-    output_path = OUTPUT_DIR / f"ocr_{os.urandom(8).hex()}.txt"
-    
-    try:
-        save_upload_file(file, temp_path)
-        
-        text_content = []
-        
-        if file.filename.endswith('.pdf'):
-            # Convert PDF to images then OCR
-            images = convert_from_path(str(temp_path))
-            for img in images:
-                text = pytesseract.image_to_string(img, lang=language)
-                text_content.append(text)
-        else:
-            # Direct image OCR
-            img = Image.open(temp_path)
-            text = pytesseract.image_to_string(img, lang=language)
-            text_content.append(text)
-        
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n\n".join(text_content))
-        
-        return FileResponse(
-            output_path,
-            media_type="text/plain",
-            filename=f"ocr_text.txt"
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        cleanup_files(temp_path)
-
-
-# ===================================
 # IMAGE TO PDF
 # ===================================
 
@@ -389,7 +278,6 @@ async def image_to_pdf(
     output_path = OUTPUT_DIR / f"images_{os.urandom(8).hex()}.pdf"
     
     try:
-        # Get page size
         page_sizes = {
             "A4": A4,
             "Letter": letter,
@@ -405,14 +293,11 @@ async def image_to_pdf(
             save_upload_file(file, temp_path)
             temp_files.append(temp_path)
             
-            # Open and process image
             img = Image.open(temp_path)
-            
-            # Calculate scaling to fit page
             img_width, img_height = img.size
             scale = min(width / img_width, height / img_height)
             
-            new_width = img_width * scale * 0.9  # 90% of page
+            new_width = img_width * scale * 0.9
             new_height = img_height * scale * 0.9
             
             x = (width - new_width) / 2
@@ -465,16 +350,9 @@ async def rotate_pdf(
         
         rotation_angle = int(rotation)
         
-        # Parse page ranges
-        if pages:
-            page_numbers = set(parse_page_ranges(pages, len(reader.pages)))
-        else:
-            page_numbers = set(range(len(reader.pages)))
-        
-        for i, page in enumerate(reader.pages):
-            if i in page_numbers:
-                page.rotate(rotation_angle)
-            writer.add_page(page)
+        for page in reader.pages:
+            rotated_page = page.rotate(rotation_angle)
+            writer.add_page(rotated_page)
         
         with open(output_path, "wb") as output_file:
             writer.write(output_file)
@@ -519,13 +397,11 @@ async def add_watermark(
         
         reader = PdfReader(str(temp_path))
         
-        # Create watermark PDF
         c = canvas.Canvas(str(watermark_path), pagesize=letter)
         c.setFont("Helvetica", 60)
         c.setFillAlpha(float(opacity))
         c.setFillColorRGB(0.5, 0.5, 0.5)
         
-        # Rotate and center watermark
         c.saveState()
         c.translate(300, 400)
         c.rotate(45)
@@ -533,7 +409,6 @@ async def add_watermark(
         c.restoreState()
         c.save()
         
-        # Apply watermark to all pages
         watermark_reader = PdfReader(str(watermark_path))
         watermark_page = watermark_reader.pages[0]
         
@@ -559,6 +434,205 @@ async def add_watermark(
 
 
 # ===================================
+# NEW FEATURE A: TEXT ANALYSIS
+# ===================================
+
+@app.post("/api/analyze-text")
+async def analyze_text(files: List[UploadFile] = File(...)):
+    """Analyze PDF text - keyword search, word count, spell check"""
+    if len(files) != 1:
+        raise HTTPException(status_code=400, detail="Only one file allowed")
+    
+    file = files[0]
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files allowed")
+    
+    temp_path = UPLOAD_DIR / file.filename
+    
+    try:
+        save_upload_file(file, temp_path)
+        
+        # Extract all text
+        all_text = []
+        with pdfplumber.open(str(temp_path)) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                text = page.extract_text()
+                if text:
+                    all_text.append({
+                        "page": page_num,
+                        "text": text
+                    })
+        
+        # Combine all text
+        combined_text = " ".join([p["text"] for p in all_text])
+        
+        # Word count
+        words = re.findall(r'\b\w+\b', combined_text.lower())
+        total_words = len(words)
+        word_freq = Counter(words)
+        top_keywords = word_freq.most_common(20)
+        
+        # Spell check
+        typos = []
+        if SPELL_CHECKER_AVAILABLE:
+            spell = SpellChecker()
+            unique_words = set(words)
+            misspelled = spell.unknown(unique_words)
+            
+            for word in list(misspelled)[:50]:  # Limit to 50 typos
+                suggestions = spell.candidates(word)
+                if suggestions:
+                    typos.append({
+                        "incorrect": word,
+                        "suggestions": list(suggestions)[:3]
+                    })
+        
+        return JSONResponse({
+            "total_words": total_words,
+            "unique_words": len(set(words)),
+            "top_keywords": [{"word": word, "count": count} for word, count in top_keywords],
+            "typos": typos,
+            "pages": len(all_text),
+            "spell_checker_available": SPELL_CHECKER_AVAILABLE
+        })
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        cleanup_files(temp_path)
+
+
+# ===================================
+# NEW FEATURE B: TEXT DECORATION
+# ===================================
+
+@app.post("/api/edit-text-style")
+async def edit_text_style(
+    text_content: str = Form(default=""),
+    font_size: int = Form(default=12),
+    font_color: str = Form(default="#000000"),
+    font_family: str = Form(default="Helvetica"),
+    page_size: str = Form(default="A4"),
+    files: List[UploadFile] = File(default=[])
+):
+    """Create new PDF with styled text"""
+    temp_path = None
+    
+    # If file provided, extract text first
+    if files and len(files) > 0 and files[0].filename:
+        file = files[0]
+        if file.filename.endswith('.pdf'):
+            temp_path = UPLOAD_DIR / file.filename
+            save_upload_file(file, temp_path)
+            
+            try:
+                with pdfplumber.open(str(temp_path)) as pdf:
+                    extracted_text = []
+                    for page in pdf.pages:
+                        text = page.extract_text()
+                        if text:
+                            extracted_text.append(text)
+                    text_content = "\n\n".join(extracted_text)
+            except Exception as e:
+                cleanup_files(temp_path)
+                raise HTTPException(status_code=500, detail=f"Error extracting text: {str(e)}")
+    
+    # Validate that we have text content
+    if not text_content or not text_content.strip():
+        if temp_path:
+            cleanup_files(temp_path)
+        raise HTTPException(status_code=400, detail="Please provide text content or upload a PDF file")
+    
+    output_path = OUTPUT_DIR / f"styled_{os.urandom(8).hex()}.pdf"
+    
+    try:
+        # Page size
+        page_sizes_map = {"A4": A4, "Letter": letter, "Legal": legal}
+        size = page_sizes_map.get(page_size, A4)
+        
+        # Create PDF
+        c = canvas.Canvas(str(output_path), pagesize=size)
+        width, height = size
+        
+        # Set font
+        font_map = {
+            "Helvetica": "Helvetica",
+            "Times": "Times-Roman",
+            "Courier": "Courier",
+            "Arial": "Helvetica",  # Fallback
+        }
+        selected_font = font_map.get(font_family, "Helvetica")
+        
+        # Parse text color
+        try:
+            text_color = HexColor(font_color) if font_color else HexColor("#000000")
+        except:
+            text_color = HexColor("#000000")
+        
+        # Add text with line wrapping
+        y_position = height - 50
+        margin = 50
+        line_height = font_size * 1.5
+        max_width = width - (2 * margin)
+        
+        lines = text_content.split('\n')
+        for line in lines:
+            if not line.strip():
+                y_position -= line_height
+                continue
+                
+            if y_position < 50:  # New page
+                c.showPage()
+                y_position = height - 50
+            
+            # Simple word wrapping
+            words = line.split(' ')
+            current_line = ""
+            
+            for word in words:
+                test_line = current_line + word + " "
+                if c.stringWidth(test_line, selected_font, font_size) <= max_width:
+                    current_line = test_line
+                else:
+                    if current_line:
+                        # Draw text with proper color
+                        c.setFont(selected_font, font_size)
+                        c.setFillColor(text_color)
+                        c.drawString(margin, y_position, current_line.strip())
+                        y_position -= line_height
+                        
+                        if y_position < 50:
+                            c.showPage()
+                            y_position = height - 50
+                    
+                    current_line = word + " "
+            
+            # Draw remaining text
+            if current_line.strip():
+                # Draw text with proper color
+                c.setFont(selected_font, font_size)
+                c.setFillColor(text_color)
+                c.drawString(margin, y_position, current_line.strip())
+                y_position -= line_height
+        
+        c.save()
+        
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            filename=f"styled_{os.path.basename(output_path)}"
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        if temp_path:
+            cleanup_files(temp_path)
+
+
+# ===================================
 # HEALTH CHECK
 # ===================================
 
@@ -570,4 +644,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)

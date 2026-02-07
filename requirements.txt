@@ -14,8 +14,8 @@ pdfplumber==0.11.4
 Pillow>=10.4.0
 pdf2image==1.17.0
 
-# OCR (Optical Character Recognition)
-pytesseract==0.3.13
+# Text Analysis
+pyspellchecker==0.8.1
 
 # Additional utilities
 python-dotenv==1.0.1
