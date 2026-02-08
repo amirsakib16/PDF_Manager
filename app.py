@@ -100,8 +100,7 @@ async def merge_pdfs(files: List[UploadFile] = File(...)):
     output_path = OUTPUT_DIR / f"merged_{os.urandom(8).hex()}.pdf"
     
     try:
-        from pypdf import PdfMerger
-        merger = PdfMerger()
+        writer = PdfWriter()
         
         for file in files:
             if not file.filename.endswith('.pdf'):
@@ -111,10 +110,12 @@ async def merge_pdfs(files: List[UploadFile] = File(...)):
             save_upload_file(file, temp_path)
             temp_files.append(temp_path)
             
-            merger.append(str(temp_path))
+            reader = PdfReader(str(temp_path))
+            for page in reader.pages:
+                writer.add_page(page)
         
-        merger.write(str(output_path))
-        merger.close()
+        with open(output_path, "wb") as output_file:
+            writer.write(output_file)
         
         return FileResponse(
             output_path,
@@ -156,8 +157,9 @@ async def compress_pdf(
         writer = PdfWriter()
         
         for page in reader.pages:
-            page.compress_content_streams()
             writer.add_page(page)
+            # Compress the page after adding it to the writer
+            writer.pages[-1].compress_content_streams()
         
         with open(output_path, "wb") as output_file:
             writer.write(output_file)
@@ -356,8 +358,8 @@ async def rotate_pdf(
         rotation_angle = int(rotation)
         
         for page in reader.pages:
-            page.rotate(rotation_angle)
-            writer.add_page(page)
+            rotated_page = page.rotate(rotation_angle)
+            writer.add_page(rotated_page)
         
         with open(output_path, "wb") as output_file:
             writer.write(output_file)
@@ -508,80 +510,46 @@ async def analyze_text(files: List[UploadFile] = File(...)):
         cleanup_files(temp_path)
 
 
-@app.post("/api/search-keyword")
-async def search_keyword(
-    files: List[UploadFile] = File(...),
-    keyword: str = Form(...)
-):
-    """Search for keyword in PDF"""
-    if len(files) != 1:
-        raise HTTPException(status_code=400, detail="Only one file allowed")
-    
-    file = files[0]
-    temp_path = UPLOAD_DIR / file.filename
-    
-    try:
-        save_upload_file(file, temp_path)
-        
-        results = []
-        with pdfplumber.open(str(temp_path)) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                text = page.extract_text()
-                if text and keyword.lower() in text.lower():
-                    # Find all occurrences
-                    lines = text.split('\n')
-                    for line_num, line in enumerate(lines, 1):
-                        if keyword.lower() in line.lower():
-                            results.append({
-                                "page": page_num,
-                                "line": line_num,
-                                "context": line.strip()
-                            })
-        
-        return JSONResponse({
-            "keyword": keyword,
-            "total_matches": len(results),
-            "results": results[:100]  # Limit to 100 results
-        })
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-    finally:
-        cleanup_files(temp_path)
-
-
 # ===================================
 # NEW FEATURE B: TEXT DECORATION
 # ===================================
 
 @app.post("/api/edit-text-style")
 async def edit_text_style(
-    files: List[UploadFile] = File(...),
-    text_content: str = Form(...),
+    text_content: str = Form(default=""),
     font_size: int = Form(default=12),
     font_color: str = Form(default="#000000"),
     font_family: str = Form(default="Helvetica"),
-    highlight_color: str = Form(default=""),
-    page_size: str = Form(default="A4")
+    page_size: str = Form(default="A4"),
+    files: List[UploadFile] = File(default=[])
 ):
     """Create new PDF with styled text"""
-    if len(files) > 0:
-        # If file provided, extract text first
+    temp_path = None
+    
+    # If file provided, extract text first
+    if files and len(files) > 0 and files[0].filename:
         file = files[0]
-        temp_path = UPLOAD_DIR / file.filename
-        save_upload_file(file, temp_path)
-        
-        try:
-            with pdfplumber.open(str(temp_path)) as pdf:
-                extracted_text = []
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        extracted_text.append(text)
-                text_content = "\n\n".join(extracted_text)
-        finally:
+        if file.filename.endswith('.pdf'):
+            temp_path = UPLOAD_DIR / file.filename
+            save_upload_file(file, temp_path)
+            
+            try:
+                with pdfplumber.open(str(temp_path)) as pdf:
+                    extracted_text = []
+                    for page in pdf.pages:
+                        text = page.extract_text()
+                        if text:
+                            extracted_text.append(text)
+                    text_content = "\n\n".join(extracted_text)
+            except Exception as e:
+                cleanup_files(temp_path)
+                raise HTTPException(status_code=500, detail=f"Error extracting text: {str(e)}")
+    
+    # Validate that we have text content
+    if not text_content or not text_content.strip():
+        if temp_path:
             cleanup_files(temp_path)
+        raise HTTPException(status_code=400, detail="Please provide text content or upload a PDF file")
     
     output_path = OUTPUT_DIR / f"styled_{os.urandom(8).hex()}.pdf"
     
@@ -602,42 +570,58 @@ async def edit_text_style(
             "Arial": "Helvetica",  # Fallback
         }
         selected_font = font_map.get(font_family, "Helvetica")
-        c.setFont(selected_font, font_size)
         
-        # Set text color
+        # Parse text color
         try:
-            color = HexColor(font_color)
-            c.setFillColor(color)
+            text_color = HexColor(font_color) if font_color else HexColor("#000000")
         except:
-            c.setFillColorRGB(0, 0, 0)
+            text_color = HexColor("#000000")
         
-        # Add highlight background if specified
+        # Add text with line wrapping
         y_position = height - 50
         margin = 50
         line_height = font_size * 1.5
+        max_width = width - (2 * margin)
         
         lines = text_content.split('\n')
         for line in lines:
+            if not line.strip():
+                y_position -= line_height
+                continue
+                
             if y_position < 50:  # New page
                 c.showPage()
-                c.setFont(selected_font, font_size)
-                try:
-                    c.setFillColor(HexColor(font_color))
-                except:
-                    c.setFillColorRGB(0, 0, 0)
                 y_position = height - 50
             
-            # Draw highlight if specified
-            if highlight_color:
-                try:
-                    c.setFillColor(HexColor(highlight_color))
-                    c.rect(margin - 5, y_position - 5, width - 2 * margin + 10, line_height, fill=1, stroke=0)
-                    c.setFillColor(HexColor(font_color))
-                except:
-                    pass
+            # Simple word wrapping
+            words = line.split(' ')
+            current_line = ""
             
-            c.drawString(margin, y_position, line[:100])  # Limit line length
-            y_position -= line_height
+            for word in words:
+                test_line = current_line + word + " "
+                if c.stringWidth(test_line, selected_font, font_size) <= max_width:
+                    current_line = test_line
+                else:
+                    if current_line:
+                        # Draw text with proper color
+                        c.setFont(selected_font, font_size)
+                        c.setFillColor(text_color)
+                        c.drawString(margin, y_position, current_line.strip())
+                        y_position -= line_height
+                        
+                        if y_position < 50:
+                            c.showPage()
+                            y_position = height - 50
+                    
+                    current_line = word + " "
+            
+            # Draw remaining text
+            if current_line.strip():
+                # Draw text with proper color
+                c.setFont(selected_font, font_size)
+                c.setFillColor(text_color)
+                c.drawString(margin, y_position, current_line.strip())
+                y_position -= line_height
         
         c.save()
         
@@ -649,6 +633,10 @@ async def edit_text_style(
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+    finally:
+        if temp_path:
+            cleanup_files(temp_path)
 
 
 # ===================================
@@ -663,4 +651,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=5000)
